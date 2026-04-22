@@ -115,15 +115,24 @@ async function fetchBearerToken() {
 
 // ── Core fetch helper — resolves full or relative URLs
 async function bdFetch(path, accept) {
-  const bearer = await getBearerToken();
   const url = path.startsWith("http") ? path : `${BD_URL}${path}`;
-  const res = await fetchWithTimeout(url, {
-    headers: {
-      Authorization: `Bearer ${bearer}`,
-      Accept: accept,
-      "Content-Type": "application/json",
-    },
-  });
+  const doFetch = async () => {
+    const bearer = await getBearerToken();
+    return fetchWithTimeout(url, {
+      headers: {
+        Authorization: `Bearer ${bearer}`,
+        Accept: accept,
+        "Content-Type": "application/json",
+      },
+    });
+  };
+  let res = await doFetch();
+  // Retry once on 401: cached token may have been revoked server-side.
+  if (res.status === 401) {
+    log(`401 on ${path} - refreshing token and retrying once`);
+    invalidateToken();
+    res = await doFetch();
+  }
   const raw = await res.text();
   log(`Body preview: ${raw.slice(0, 200)}`);
   if (!res.ok) throw new Error(`API error ${res.status} for ${path}: ${raw}`);
@@ -157,10 +166,29 @@ async function bdFetchAll(path, accept) {
 
 const server = new McpServer({ name: "blackduck", version: "1.0.0" });
 
+// Wrap tool handlers so uncaught errors reach the MCP client as readable
+// error content instead of terminating the request opaquely.
+function safeHandler(handler) {
+  return async (args) => {
+    try {
+      return await handler(args);
+    } catch (err) {
+      const msg = err && err.message ? err.message : String(err);
+      log(`Tool error: ${err && err.stack ? err.stack : msg}`);
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Error: ${msg}` }],
+      };
+    }
+  };
+}
+const safeTool = (name, desc, schema, handler) =>
+  server.tool(name, desc, schema, safeHandler(handler));
+
 // ────────────────────────────────────────────────
 // USE CASE 1: List all projects
 // ────────────────────────────────────────────────
-server.tool("list_projects", "List all BlackDuck projects", {}, async () => {
+safeTool("list_projects", "List all BlackDuck projects", {}, async () => {
   const items = await bdFetchAll("/api/projects", ACCEPT.project);
   const result = items.map(p => ({
     name: p.name,
@@ -174,16 +202,16 @@ server.tool("list_projects", "List all BlackDuck projects", {}, async () => {
 // ────────────────────────────────────────────────
 // USE CASE 2: Get versions for a project
 // ────────────────────────────────────────────────
-server.tool(
+safeTool(
   "get_project_versions",
   "Get all versions for a BlackDuck project sorted latest first",
   { projectId: z.string().describe("UUID from list_projects") },
   async ({ projectId }) => {
-    const data = await bdFetch(
-      `/api/projects/${projectId}/versions?limit=20&sort=createdAt%20DESC`,
+    const items = await bdFetchAll(
+      `/api/projects/${projectId}/versions?sort=createdAt%20DESC`,
       ACCEPT.version
     );
-    const result = (data.items ?? []).map(v => ({
+    const result = items.map(v => ({
       versionName: v.versionName,
       versionId: extractId(v._meta?.href),
       phase: v.phase,
@@ -198,7 +226,7 @@ server.tool(
 // ────────────────────────────────────────────────
 // USE CASE 3: Get BOM components (all pages)
 // ────────────────────────────────────────────────
-server.tool(
+safeTool(
   "get_bom_components",
   "Get all BOM components for a project version",
   {
@@ -231,7 +259,7 @@ server.tool(
 // ────────────────────────────────────────────────
 // USE CASE 4: Get policy violations only
 // ────────────────────────────────────────────────
-server.tool(
+safeTool(
   "get_policy_violations",
   "Get policy violations for a project version",
   {
@@ -261,9 +289,14 @@ server.tool(
           violatingComponents: violated.map(c => ({
             componentName: c.componentName,
             version: c.componentVersionName,
+            componentId: extractId(c.component),
+            componentVersionId: extractId(c.componentVersion),
             policyStatus: c.policyStatus,
             approvalStatus: c.approvalStatus,
             licenses: c.licenses?.map(l => l.licenseDisplay),
+            securityRisk: c.securityRiskProfile?.counts,
+            licenseRisk: c.licenseRiskProfile?.counts,
+            operationalRisk: c.operationalRiskProfile?.counts,
           })),
         }, null, 2)
       }]
@@ -274,7 +307,7 @@ server.tool(
 // ────────────────────────────────────────────────
 // USE CASE 5: Get vulnerabilities for a component
 // ────────────────────────────────────────────────
-server.tool(
+safeTool(
   "get_component_vulnerabilities",
   "Get CVEs and vulnerabilities for a specific component version",
   {
@@ -307,7 +340,7 @@ server.tool(
 // ────────────────────────────────────────────────
 // USE CASE 6: Search components by CVE ID
 // ────────────────────────────────────────────────
-server.tool(
+safeTool(
   "search_by_cve",
   "Find which BOM components in a project version are affected by a specific CVE",
   {
@@ -317,37 +350,23 @@ server.tool(
   },
   async ({ projectId, versionId, cveId }) => {
     log(`Searching for CVE: ${cveId}`);
-    const allComponents = await bdFetchAll(
-      `/api/projects/${projectId}/versions/${versionId}/components`,
+    // /vulnerable-bom-components returns a flattened list of BOM items and
+    // their CVEs - one paginated fetch instead of N per-component calls.
+    const items = await bdFetchAll(
+      `/api/projects/${projectId}/versions/${versionId}/vulnerable-bom-components`,
       ACCEPT.bom
     );
-
-    const affected = [];
-    for (const c of allComponents) {
-      const cId = extractId(c.component);
-      const cvId = extractId(c.componentVersion);
-      if (!cId || !cvId) continue;
-
-      try {
-        const vulns = await bdFetchAll(
-          `/api/projects/${projectId}/versions/${versionId}/components/${cId}/versions/${cvId}/vulnerabilities`,
-          ACCEPT.vulnerability
-        );
-        const match = vulns.filter(v => v.name?.toUpperCase() === cveId.toUpperCase());
-        if (match.length > 0) {
-          affected.push({
-            componentName: c.componentName,
-            componentVersion: c.componentVersionName,
-            cve: cveId,
-            severity: match[0].severity,
-            cvss3Score: match[0].cvss3?.baseScore,
-            remediationStatus: match[0].remediationStatus,
-          });
-        }
-      } catch (e) {
-        log(`Skipping vuln fetch for ${c.componentName}: ${e.message}`);
-      }
-    }
+    const cveUpper = cveId.toUpperCase();
+    const affected = items
+      .filter(i => i.vulnerabilityWithRemediation?.vulnerabilityName?.toUpperCase() === cveUpper)
+      .map(i => ({
+        componentName: i.componentName,
+        componentVersion: i.componentVersionName,
+        cve: i.vulnerabilityWithRemediation.vulnerabilityName,
+        severity: i.vulnerabilityWithRemediation.severity,
+        baseScore: i.vulnerabilityWithRemediation.baseScore,
+        remediationStatus: i.vulnerabilityWithRemediation.remediationStatus,
+      }));
 
     return {
       content: [{
@@ -364,7 +383,7 @@ server.tool(
 // ────────────────────────────────────────────────
 // USE CASE 7: Get license risks
 // ────────────────────────────────────────────────
-server.tool(
+safeTool(
   "get_license_risks",
   "Get all components with HIGH or CRITICAL license risk in a project version",
   {
@@ -404,7 +423,7 @@ server.tool(
 // ────────────────────────────────────────────────
 // USE CASE 8: Get scan / code location status
 // ────────────────────────────────────────────────
-server.tool(
+safeTool(
   "get_scan_status",
   "Get latest scan results and code location status for a project version",
   {
@@ -412,11 +431,11 @@ server.tool(
     versionId: z.string(),
   },
   async ({ projectId, versionId }) => {
-    const data = await bdFetch(
+    const items = await bdFetchAll(
       `/api/projects/${projectId}/versions/${versionId}/codelocations`,
       ACCEPT.codeLocation
     );
-    const result = (data.items ?? []).map(s => ({
+    const result = items.map(s => ({
       name: s.name,
       scanType: s.type,
       createdAt: s.createdAt,
@@ -430,7 +449,7 @@ server.tool(
 // ────────────────────────────────────────────────
 // USE CASE 9: Get risk summary for a version
 // ────────────────────────────────────────────────
-server.tool(
+safeTool(
   "get_risk_summary",
   "Get security, license and operational risk summary counts for a project version",
   {
@@ -460,7 +479,7 @@ server.tool(
 // ────────────────────────────────────────────────
 // USE CASE 10: ONE-SHOT — full findings for a project
 // ────────────────────────────────────────────────
-server.tool(
+safeTool(
   "get_findings_for_project",
   "One-shot: find project by name, get latest version, return all violations + risk summary",
   { projectName: z.string().describe("Partial or full project name e.g. vmui") },
@@ -536,8 +555,13 @@ server.tool(
           violatingComponents: violated.map(c => ({
             componentName: c.componentName,
             version: c.componentVersionName,
+            componentId: extractId(c.component),
+            componentVersionId: extractId(c.componentVersion),
             policyStatus: c.policyStatus,
             licenses: c.licenses?.map(l => l.licenseDisplay),
+            securityRisk: c.securityRiskProfile?.counts,
+            licenseRisk: c.licenseRiskProfile?.counts,
+            operationalRisk: c.operationalRiskProfile?.counts,
           })),
           securityRiskyComponents: securityRisky,
           totalViolating: violated.length,
