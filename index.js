@@ -21,7 +21,9 @@ const ACCEPT = {
   project:      "application/vnd.blackducksoftware.project-detail-4+json",
   version:      "application/vnd.blackducksoftware.project-detail-5+json",
   bom:          "application/vnd.blackducksoftware.bill-of-materials-6+json",
-  policy:       "application/vnd.blackducksoftware.policy-status-4+json",
+  // Project-version aggregate policy-status endpoint uses the BOM media type.
+  // The old policy-status-4/5+json types are kept as fallbacks for older BlackDuck servers.
+  policy:       "application/vnd.blackducksoftware.bill-of-materials-6+json, application/vnd.blackducksoftware.policy-status-5+json, application/vnd.blackducksoftware.policy-status-4+json",
   component:    "application/vnd.blackducksoftware.component-detail-5+json",
   vulnerability:"application/vnd.blackducksoftware.vulnerability-4+json",
   report:       "application/vnd.blackducksoftware.report-4+json",
@@ -58,7 +60,33 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
 }
 
 // ── Auth: exchange API token for short-lived Bearer JWT
+// Bearer token cache: BlackDuck JWTs are valid for hours. Caching prevents
+// re-authenticating on every paginated page / tool call, which previously
+// made the MCP appear "stuck". An in-flight promise de-dupes concurrent
+// auth requests from a burst of paginated fetches.
+let cachedToken = null;
+let cachedTokenExpiresAt = 0;
+let inFlightAuth = null;
+const DEFAULT_TOKEN_TTL_MS = 5 * 60 * 1000;
+const TOKEN_SAFETY_BUFFER_MS = 60 * 1000;
+
+function invalidateToken() {
+  cachedToken = null;
+  cachedTokenExpiresAt = 0;
+}
+
 async function getBearerToken() {
+  const now = Date.now();
+  if (cachedToken && now < cachedTokenExpiresAt) {
+    return cachedToken;
+  }
+  if (!inFlightAuth) {
+    inFlightAuth = fetchBearerToken().finally(() => { inFlightAuth = null; });
+  }
+  return inFlightAuth;
+}
+
+async function fetchBearerToken() {
   const res = await fetchWithTimeout(`${BD_URL}/api/tokens/authenticate`, {
     method: "POST",
     headers: {
@@ -75,6 +103,13 @@ async function getBearerToken() {
   const data = JSON.parse(raw);
   if (!data.bearerToken) throw new Error(`No bearerToken in response: ${raw}`);
   log("Auth OK — bearer token acquired");
+  const serverTtl = Number(data.expiresInMilliseconds);
+  const ttl = Number.isFinite(serverTtl) && serverTtl > TOKEN_SAFETY_BUFFER_MS
+    ? serverTtl - TOKEN_SAFETY_BUFFER_MS
+    : DEFAULT_TOKEN_TTL_MS;
+  cachedToken = data.bearerToken;
+  cachedTokenExpiresAt = Date.now() + ttl;
+  log(`Token cached for ${Math.round(ttl / 1000)}s`);
   return data.bearerToken;
 }
 
