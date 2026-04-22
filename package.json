@@ -1,6 +1,6 @@
 {
   "name": "@rsabde/blackduck-mcp",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "A Model Context Protocol (MCP) server for Blackduck and Server APIs, built with Node.js. Provides comprehensive tools for listing BOM, Operational risks and security issues",
   "keywords": [
     "mcp",
