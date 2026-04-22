@@ -1,0 +1,23 @@
+{
+  "name": "blackduck-mcp",
+  "version": "1.0.0",
+  "description": "A Model Context Protocol (MCP) server for Blackduck and Server APIs, built with Node.js. Provides comprehensive tools for listing BOM, Operational risks and security issues",
+  "keywords": [],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rushikeshsabde/blackduck-mcp"
+  },
+  "license": "ISC",
+  "author": "rsabde",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "node-fetch": "^3.3.2",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {}
+}
