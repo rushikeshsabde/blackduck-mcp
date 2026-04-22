@@ -1,16 +1,30 @@
 {
-  "name": "blackduck-mcp",
-  "version": "1.0.0",
+  "name": "@rsabde/blackduck-mcp",
+  "version": "1.0.1",
   "description": "A Model Context Protocol (MCP) server for Blackduck and Server APIs, built with Node.js. Provides comprehensive tools for listing BOM, Operational risks and security issues",
-  "keywords": [],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "blackduck",
+    "security",
+    "vulnerability",
+    "sca",
+    "software-composition-analysis",
+    "ai",
+    "windsurf",
+    "claude"
+  ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/rushikeshsabde/blackduck-mcp"
+    "url": "git+https://github.com/rushikeshsabde/blackduck-mcp.git"
   },
   "license": "ISC",
   "author": "rsabde",
   "type": "module",
   "main": "index.js",
+  "bin": {
+    "blackduck-mcp": "index.js"
+  },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
   },
